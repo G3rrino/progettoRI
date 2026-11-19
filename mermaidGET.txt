@@ -1,0 +1,54 @@
+[CLIENT: Validazione locale preliminare]
+   |-- validate_remote_name(remote_name) < 0 ----------> [stderr, exit(!=0)]
+   v
+====================================================================================================
+FASE 1: Individuazione Storage (Client <-> Coordinator)
+====================================================================================================
+[CLIENT]                                              [COORDINATOR]
+   |-- connect_to_loopback(coord_port) -> c_fd
+   |-- conn_init(&c_conn, c_fd)
+   |-- send_all(c_fd, "GET <remote_name>\n") -------->|
+   |                                                  |-- conn_fill() + conn_try_extract_line()
+   |                                                  +-- 1. LINE_EOF/ERR ------------> close(fd)
+   |                                                  +-- 2. OVERFLOW / sintassi -------> "ERR BAD_REQUEST\n"
+   |                                                  +-- 3. validate_remote_name < 0 --> "ERR INVALID_NAME\n"
+   |                                                  +-- 4. active_storages == 0 ------> "ERR STORAGE_UNAVAILABLE\n"
+   |                                                  +-- 5. file assente in indice ----> "ERR NOT_FOUND\n"
+   |   |<-- send_all("FOUND <id> 127.0.0.1 <port> <sz>\n")-- 6. OK
+   |
+   |-- recv_line_blocking(&c_conn, line, 512, &len)
+   |-- close(c_fd)
+   |-- se LINE_EOF / LINE_ERR / "ERR ..." -----------> [stderr, exit(!=0)]
+   |-- parse_strict_port() -> st_port, parse_strict_uint64() -> expected_size
+   v
+====================================================================================================
+FASE 2: Download binario (Client <-> Storage)
+====================================================================================================
+[CLIENT]                                              [STORAGE]
+   |-- connect_to_loopback(st_port) -> s_fd
+   |-- conn_init(&s_conn, s_fd)                       |-- accept() -> conn_init(&cli_conn, cli_fd)
+   |-- send_all(s_fd, "DOWNLOAD <remote_name>\n") --->|
+   |                                                  |-- recv_line_blocking(&cli_conn, ...)
+   |                                                  +-- 1. LINE_EOF/ERR ------------> close(cli_fd)
+   |                                                  +-- 2. OVERFLOW / sintassi -------> "ERR BAD_REQUEST\n"
+   |                                                  +-- 3. validate_remote_name < 0 --> "ERR INVALID_NAME\n"
+   |                                                  +-- 4. open/fstat ENOENT ---------> "ERR NOT_FOUND\n"
+   |                                                  +-- 5. altro errore open/fstat ---> "ERR IO_ERROR\n"
+   |   |<-- send_all(cli_fd, "DATA <size>\n") --------+-- 6. OK
+   |
+   |-- recv_line_blocking(&s_conn, line, 512, &len)
+   |   (eventuali primi byte del file restano in s_conn.buf dopo '\n')
+   |-- se LINE_EOF / LINE_ERR / "ERR ..." -----------> [close(s_fd), stderr, exit(!=0)]
+   |-- open("<local_file>.part", O_WRONLY|O_CREAT|O_TRUNC)
+   |
+   |-- recv_file_stream(&s_conn, part_fd, size) <=== [blocchi <= 4096 B] <=== send_file_stream(cli_fd, file_fd, size)
+   |   (svuota prima s_conn.buf, poi chiama recv)
+   |
+   +-- se recv_file_stream < 0 (EOF prematuro da Storage o errore disco):
+   |     |-- close(part_fd), unlink("<local_file>.part")
+   |     |-- close(s_fd), stderr, exit(!=0)
+   |
+   +-- se recv_file_stream == 0 (tutti i size byte ricevuti):
+         |-- close(part_fd)
+         |-- rename("<local_file>.part", "<local_file>")
+         |-- close(s_fd) -> exit(0)

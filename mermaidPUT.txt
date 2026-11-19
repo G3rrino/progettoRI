@@ -1,0 +1,59 @@
+[CLIENT: Validazione locale preliminare]
+   |-- validate_remote_name(remote_name) < 0 ----------> [stderr, exit(!=0)]
+   |-- open(local_file, O_RDONLY) + fstat() (S_ISREG)
+   |   se errore o non file regolare ------------------> [stderr, exit(!=0)]
+   |   ricava uint64_t size
+   v
+====================================================================================================
+FASE 1: Risoluzione Storage (Client <-> Coordinator)
+====================================================================================================
+[CLIENT]                                              [COORDINATOR]
+   |-- connect_to_loopback(coord_port) -> c_fd
+   |-- conn_init(&c_conn, c_fd)
+   |-- send_all(c_fd, "PUT <remote_name> <size>\n") ->|
+   |                                                  |-- conn_fill() + conn_try_extract_line()
+   |                                                  +-- 1. LINE_EOF/ERR ------------> close(fd)
+   |                                                  +-- 2. OVERFLOW / sintassi -------> "ERR BAD_REQUEST\n"
+   |                                                  +-- 3. validate_remote_name < 0 --> "ERR INVALID_NAME\n"
+   |                                                  +-- 4. active_storages == 0 ------> "ERR STORAGE_UNAVAILABLE\n"
+   |   |<-- send_all("STORE <id> 127.0.0.1 <port>\n")-+-- 5. OK (sceglie Storage)
+   |
+   |-- recv_line_blocking(&c_conn, line, 512, &len)
+   |-- close(c_fd)
+   |-- se LINE_EOF / LINE_ERR / "ERR ..." -----------> [close(local_fd), stderr, exit(!=0)]
+   |-- parse_strict_port() -> st_port
+   v
+====================================================================================================
+FASE 2: Trasferimento file e commit (Client <-> Storage <-> Coordinator)
+====================================================================================================
+[CLIENT]                                [STORAGE]                                     [COORDINATOR]
+   |-- connect_to_loopback(st_port)->s_fd
+   |-- conn_init(&s_conn, s_fd)         |-- accept() -> conn_init(&cli_conn, cli_fd)
+   |-- send_all("UPLOAD <name> <size>\n")-->|
+   |                                    |-- recv_line_blocking(&cli_conn, ...)
+   |                                    +-- 1. LINE_EOF/ERR ------------> close(cli_fd)
+   |                                    +-- 2. OVERFLOW / sintassi -----> "ERR BAD_REQUEST\n"
+   |                                    +-- 3. validate_remote_name < 0 > "ERR INVALID_NAME\n"
+   |                                    +-- 4. open("<name>.part") < 0 -> "ERR IO_ERROR\n"
+   |   |<-- send_all(cli_fd, "READY\n")-+-- 5. OK
+   |
+   |-- recv_line_blocking(&s_conn)
+   |-- se != "READY" ------------------> [close(s_fd), close(local_fd), exit(!=0)]
+   |
+   |-- send_file_stream(s_fd, local_fd, size) ==> [blocchi <= 4096 B] ==> recv_file_stream(&cli_conn, part_fd, size)
+   |                                    |
+   |                                    +-- se recv_file_stream < 0:
+   |                                    |     |-- unlink("<name>.part")
+   |                                    |     |-- se caduta rete (ECONNRESET/EPIPE) -> close(cli_fd)
+   |   |<-- "ERR IO_ERROR\n" -----------+     +-- se errore disco -------------------> send_all("ERR IO_ERROR\n")
+   |   |  (Client: close & exit(!=0))   |
+   |                                    +-- se recv_file_stream == 0:
+   |                                          |-- close(part_fd)
+   |                                          |-- rename("<name>.part", "<name>")
+   |                                          |-- send_all(coord_fd, "STORED <name> <size>\n") -->|
+   |                                          |                                 [conn_fill + extract + aggiorna indice]
+   |                                          |<-- recv_line_blocking(&coord_conn) <--- send_all("ACK\n")
+   |   |<-- send_all("STORED <name> <size>\n")+- (se "ACK" ricevuto)
+   |
+   |-- recv_line_blocking(&s_conn) -> "STORED"
+   |-- close(s_fd), close(local_fd) -> exit(0)

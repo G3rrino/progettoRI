@@ -1,0 +1,35 @@
+[CLIENT]                                              [COORDINATOR (select + O_NONBLOCK)]
+   |
+   |-- connect_to_loopback(coord_port) -> c_fd
+   |-- conn_init(&c_conn, c_fd)
+   |
+   |-- send_all(c_fd, "LIST\n", 5) ------------------>|
+   |                                                  |-- conn_fill(&slot.conn)
+   |                                                  |-- conn_try_extract_line(&slot.conn, line, 512, &len)
+   |                                                  |
+   |                                                  +--[Filtro 1: Trasporto]
+   |                                                  |   LINE_EOF / LINE_ERR --------> close(fd), libera slot
+   |                                                  |
+   |                                                  +--[Filtro 2: Framing / Sintassi]
+   |                                                  |   LINE_OVERFLOW o
+   |   |<-- send_all(fd, "ERR BAD_REQUEST\n", 16) ----+   parse_control_line() < 0 ---> (se OVERFLOW: close(fd))
+   |   |                                              |
+   |   |<-- send_all(fd, "FILES <N>\n", len) ---------+--[Comando LIST valido]
+   |   |                                              |
+   |-- recv_line_blocking(&c_conn, line, 512, &len)   |
+   |   |                                              |
+   |   +-- LINE_EOF / LINE_ERR ---------------------->| [close(c_fd), stderr, exit(!=0)]
+   |   +-- "ERR BAD_REQUEST" ------------------------>| [close(c_fd), stderr, exit(!=0)]
+   |   +-- "FILES <N>" (parse_strict_uint64)          |
+   |         |                                        |
+   |         |   +---[Ripeti N volte]------------+    |
+   |         |   |                               |    |
+   |         |<--+- send_all("FILE <name> <sz> <id>\n")
+   |         |   |  recv_line_blocking(&c_conn)  |    |
+   |         |   |  (se EOF/ERR/malformato -> exit(!=0))
+   |         |   +-------------------------------+    |
+   |         |                                        |
+   |         |<-- send_all(fd, "END\n", 4) -----------+
+   |         |-- recv_line_blocking(&c_conn) -> "END"
+   |         |-- stampa elenco su stdout
+   |         |-- close(c_fd) -> exit(0)
