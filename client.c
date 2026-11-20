@@ -6,6 +6,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <signal.h>
 
 #include "net_utils.h"
 #include "protocol.h"
@@ -99,7 +100,7 @@ static int open_local_for_upload(const char*path,uint64_t*out_size){
     struct stat statbuf;
     memset(&statbuf,0,sizeof(statbuf));
     if(fstat(fd,&statbuf)==-1){
-        perro("Errore nella fstat del file, file corrotto");
+        perror("Errore nella fstat del file, file corrotto");
         close(fd);
         return -1;
     }
@@ -112,7 +113,7 @@ static int open_local_for_upload(const char*path,uint64_t*out_size){
     //dice per esempio /cartella/sottocartella (controllo sul local_path)
     //non sul remote name
     if(!S_ISREG(statbuf.st_mode)){
-        fprintf(stderr,"Errore: il file è non regolare");
+        fprintf(stderr,"Errore: il file è non regolare\n");
         close(fd);
         return -1;
     }
@@ -148,6 +149,7 @@ static int build_part_path(const char*dest_path,char*part_buf,size_t cap){
 static int handle_list(uint16_t coord_port) {
     int fd = connect_to_loopback(coord_port);
     if (fd < 0) {
+        perror("Errore di connessione con il coordinator");
         return -1;
     }
 
@@ -402,7 +404,7 @@ static int handle_get(uint16_t coord_port, const char*remote_name, const char*lo
 //gestione PUT
 static int parse_store_line(char*line,size_t raw_len,uint16_t* out_port){
     //devo verificare la riga STORE
-    if(line==NULL || raw_len<=0 || out_port==NULL){
+    if(line==NULL || raw_len==0 || out_port==NULL){
         return -1;
     }
 
@@ -417,7 +419,7 @@ static int parse_store_line(char*line,size_t raw_len,uint16_t* out_port){
     //bisognerà poi capire lato coordinator come comportarsi nel caso in cui non ci sono 
     //attualmente storage attivi o che tutti gli storage attualmente presenti hanno dimensione 
     //finita e terminata
-    if(strcmp(plt.tokens[0],"STORE")!=0 || strcmp(plt.tokens[2],"127.0.0.1") || parse_strict_port(plt.tokens[3],out_port)<0){
+    if(strcmp(plt.tokens[0],"STORE")!=0 || strcmp(plt.tokens[2],"127.0.0.1")!=0 || parse_strict_port(plt.tokens[3],out_port)<0){
         return -1;
     }
 
@@ -426,19 +428,19 @@ static int parse_store_line(char*line,size_t raw_len,uint16_t* out_port){
 
 static int parse_stored_line(char *line,size_t raw_len,const char*expected_name, uint64_t expected_size){
     //devo verificare la riga STORED
-    if(line==NULL || raw_len<=0 || expected_name==NULL){
+    if(line==NULL || raw_len==0 || expected_name==NULL){
         return -1;
     }
 
     parsed_line_t plt;
-    if(parse_control_line(line,raw_len,&plt)<0 || parsed.token_count!=3){
+    if(parse_control_line(line,raw_len,&plt)<0 || plt.token_count!=3){
         return -1;
     }
 
     //validiamo i singoli token, ci aspettiamo 
     //STORED <remote_name> <size>
     uint64_t stored_size;
-    if(strcmp(plt.tokens[0],"STORED")!=0 || strcmp(plt.tokens[1],expected_name)!=0 || parse_strict_uint64t(plt.tokens[2],&stored_size)<0 || stored_size!=excpted_size){
+    if(strcmp(plt.tokens[0],"STORED")!=0 || strcmp(plt.tokens[1],expected_name)!=0 || parse_strict_uint64(plt.tokens[2],&stored_size)<0 || stored_size!=expected_size){
         return -1;
     }
     return 0;
@@ -467,27 +469,121 @@ static int handle_put(uint16_t coord_port,const char *local_path, const char *re
     int n=snprintf(line,sizeof(line),"PUT %s %llu\n",remote_name,(unsigned long long)file_size);
     if(n<0 || (size_t)n>=sizeof(line)){
         fprintf(stderr,"Errore: comando PUT troppo lungo\n");
-        close(st_sd);
+        close(sd);
+        close(fd);
         return -1;
     }
 
-    if(send_all(sd,&line,(size_t)n)<0){
+    if(send_all(sd,line,(size_t)n)<0){
         perror("Errore nella send al coordinator");
         close(sd);
+        close(fd);
         return -1;
     }
 
-    parsed_line_t plt;
-    plt=recv_line_blocking(&ct,line,sizeof(line),&len);
-    if(plt!=LINE_OK){
-        fprintf(stderr,"");
+    size_t len=0;
+    line_status_t lst=recv_line_blocking(&ct,line,sizeof(line),&len);
+    close(sd);
+
+    if(lst!=LINE_OK){
+        fprintf(stderr,"Errore di ricezione del messaggio\n");
+        close(fd);
         return -1;
     }
 
+    if(strncmp(line,"ERR ",4)==0 && strlen(line)==len){
+        fprintf(stderr,"%s\n",line);
+        close(fd);
+        return -1;
+    }
 
+    uint16_t st_port=0;
+    if(parse_store_line(line,len,&st_port)<0){
+        fprintf(stderr,"Risposta STORE non valida dal coordinator\n");
+        close(fd);
+        return -1;
+    }
 
+    //fase2: UPLOAD <remote_name> <file_size>
+    int sds=connect_to_loopback(st_port);
+    if(sds<0){
+        perror("Errore di connessione con lo storage"); 
+        close(fd);
+        return -1;
+    }
+    conn_t cts;
+    conn_init(&cts,sds);
+    n=snprintf(line,sizeof(line),"UPLOAD %s %llu\n",remote_name,(unsigned long long)file_size);
+    if(n<0 || (size_t)n>=sizeof(line)){
+        fprintf(stderr,"Errore: comando UPLOAD troppo lungo\n");
+        close(sds);
+        close(fd); 
+        return -1;
+    }
 
+    if(send_all(sds,line,(size_t)n)<0){
+        perror("Errore nella send allo storage");
+        close(sds);
+        close(fd);
+        return -1;
+    }
+
+    //aspettiamo che ci risponda READY
+    lst=recv_line_blocking(&cts,line,sizeof(line),&len);
+    if(lst!=LINE_OK){
+        fprintf(stderr,"Errore di ricezione del messaggio\n");
+        close(sds);
+        close(fd);
+        return -1;
+    }
+
+    if(strncmp(line,"ERR ",4)==0 && strlen(line)==len){
+        fprintf(stderr,"%s\n",line);
+        close(sds);
+        close(fd);
+        return -1;
+    }
+
+    //controlliamo il formato della riga p, deve essere READY
+    parsed_line_t p;
+    if(parse_control_line(line,len,&p)<0 || p.token_count!=1 || strcmp(p.tokens[0],"READY")!=0){
+        fprintf(stderr,"Risposta READY non valida dallo storage\n");
+        close(sds);
+        close(fd);
+        return -1;
+    }
+
+    //ramo di errore della send_file_stream
+    if(send_file_stream(sds,fd,file_size)<0){
+        perror("Errore durante l'invio del file allo storage");
+        close(fd);
+        close(sds);
+        return -1;
+    }
+
+    close(fd);
+
+    lst=recv_line_blocking(&cts,line,sizeof(line),&len);
+    close(sds);
+
+    if(lst!=LINE_OK){
+        fprintf(stderr,"Errore nella ricezione della conferma STORED dallo storage\n");
+        return -1;
+    }
+
+    if(strncmp(line,"ERR ",4)==0 && strlen(line)==len){
+        fprintf(stderr,"%s\n",line);
+        return -1;
+    }
+
+    if(parse_stored_line(line,len,remote_name,file_size)<0){
+        fprintf(stderr,"Conferma STORED non valida dallo storage\n");
+        return -1;
+    }
+
+    return 0;
 }
+
 
 
 
