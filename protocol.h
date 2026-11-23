@@ -25,3 +25,4 @@ int parse_control_line(char *line,int raw_len,parsed_line_t *out);
 int validate_remote_name(const char*nome);
 int parse_strict_uint64(const char*str,uint64_t*val);
 int parse_strict_port(const char*str,uint16_t*port);
+void send_err_line(int fd, const char *err_code);

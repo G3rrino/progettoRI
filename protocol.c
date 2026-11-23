@@ -174,3 +174,14 @@ int parse_strict_port(const char*str,uint16_t*port){
     return 0;
 
 }
+
+
+//funzione di invio di una riga di errore al client
+static void send_err_line(int fd, const char *err_code) {
+    char buf[MAX_LINE_LEN];
+    int n = snprintf(buf, sizeof(buf), "%s\n", err_code);
+    //controlliamo sempre che la riga di errore non superi i 512 byte stabiliti da protocollo
+    if (n > 0 && (size_t)n < sizeof(buf)) {
+        (void)send_all(fd, buf, (size_t)n);
+    }
+}
