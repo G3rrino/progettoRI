@@ -1,0 +1,62 @@
++-------------------------------------------------------------------------+
+| AVVIO:                                                                  |
+|  1. setup_signals() -> SIGPIPE=IGN, SIGINT/SIGTERM (sa_flags=0 -> g_stop) |
+|  2. parse_sto_args() -> <coord_port> <storage_port> <storage_dir>       |
+|  3. verify_and_clean_storage_dir() -> stat(S_ISDIR) + unlink(*.part)    |
+|  4. create_listening_socket(storage_port) -> listen_fd                  |
+|  5. register_with_coordinator() -> "REGISTER <port>" / "REGISTERED <id>"|
++------------------------------------+------------------------------------+
+                                     |
+                                     v
+           +---------------------------------------------------+
++--------->|              while (!g_stop)                      |
+|          |  select(max_fd + 1, {listen_fd, coord_fd}, NULL)  |
+|          +----+--------------------+--------------------+----+
+|               |                    |                    |
+|     [ready < 0 && EINTR]  [coord_fd in readfds] [listen_fd in readfds]
+|               |                    |                    |
++---------------+                    v                    v
+                          +--------------------+  +-----------------------+
+                          | Coordinator chiuso |  | client_sd = accept()  |
+                          | inaspettatamente   |  +-----------+-----------+
+                          +---------+----------+              |
+                                    |                         v
+                                    |             +-----------------------+
+                                    |             |serve_client_connection|
+                                    |             | recv_line_blocking()  |
+                                    |             | parse_control_line()  |
+                                    |             +---+-------+-------+---+
+                                    |                 |       |       |
+                                    |     ["UPLOAD"]  |       |       | [Altro /
+                                    |     +-----------+       |       |  Overflow]
+                                    |     v                   |       v
+                                    | +---------------+       |  +---------------+
+                                    | | handle_upload |       |  | send_err_line |
+                                    | | READY->stream |       |  | ERR_BAD_REQ   |
+                                    | | rename->STORED|       |  +-------+-------+
+                                    | +-------+-------+       |          |
+                                    |         |   ["DOWNLOAD"]|          |
+                                    |         |               v          |
+                                    |         |       +---------------+  |
+                                    |         |       |handle_download|  |
+                                    |         |       | open -> DATA  |  |
+                                    |         |       | -> file stream|  |
+                                    |         |       +-------+-------+  |
+                                    |         |               |          |
+                                    |         v               v          v
+                                    |     +-------------------------------+
+                                    |     |       close(client_sd)        |
+                                    |     +---------------+---------------+
+                                    |                     |
+                                    |          [if (coord_lost == true)]
+                                    |             |               |
+                                    |            [Sì]            [No]
+                                    |             |               |
+                                    |             |               +---> (torna al while)
+                                    v             v
+                          +-------------------------------+
+                          |   USCITA DAL LOOP:            |
+                          |   close(listen_fd)            |
+                          |   close(coord_fd)             |
+                          |   return exit_code            |
+                          +-------------------------------+

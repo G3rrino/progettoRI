@@ -1,0 +1,39 @@
+CLIENT                       STORAGE                   FILESYSTEM             COORDINATOR
+            |                            |                          |                       |
+            |--- UPLOAD <name> <size> -->|                          |                       |
+            |                            |--+ 1. token_count == 3   |                       |
+            |                            |  | 2. validate_remote_name                       |
+            |                            |  | 3. size <= MAX_FILE_SIZE                      |
+            |                            |<-+                       |                       |
+            |                            |                          |                       |
+            |                            |--- stat(final) / --------|                       |
+            |                            |    stat(.part) --------->|                       |
+            |                            |                          |                       |
+            |  [Se errore / file esiste] |                          |                       |
+            |<-- ERR_BAD_REQUEST / ------|                          |                       |
+            |<-- ERR_INVALID_NAME / -----|                          |                       |
+            |<-- ERR_INVALID_SIZE / -----|                          |                       |
+            |<-- ERR_FILE_EXISTS --------|                          |                       |
+            |   (close client_sd)        |                          |                       |
+            |                            |                          |                       |
+            |  [Se controlli superati]   |--- open("<name>.part", ->|                       |
+            |                            |    O_CREAT | O_EXCL)     |                       |
+            |<-- READY ------------------|                          |                       |
+            |                            |                          |                       |
+            |=== recv_file_stream() ====>|--- write(part_fd) ------>|                       |
+            |   (esattamente size byte)  |                          |                       |
+            |                            |  [Se EOF / errore rete]  |                       |
+            |                            |--- close + unlink(.part)>|                       |
+            |                            |                          |                       |
+            |                            |--- close(part_fd) ------>|                       |
+            |                            |--- rename(.part -> name)>|                       |
+            |                            |                          |                       |
+            |                            |--- STORED <remote_name> <size> ----------------->|
+            |                            |<-- ACK ------------------------------------------|
+            |                            |                          |                       |
+            |  [Se notify fallisce]      |--- unlink(final_path) -->|                       |
+            |<-- ERR_IO -----------------|   (coord_lost = true)    |                       |
+            |                            |                          |                       |
+            |  [Se ACK ricevuto]         |                          |                       |
+            |<-- STORED <name> <size> ---|                          |                       |
+            |   (close client_sd)        |                          |                       |

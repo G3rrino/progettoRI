@@ -1,0 +1,28 @@
+CLIENT                       STORAGE                   FILESYSTEM
+            |                            |                          |
+            |--- DOWNLOAD <name> ------->|                          |
+            |                            |--+ 1. token_count == 2   |
+            |                            |  | 2. validate_remote_name
+            |                            |<-+                       |
+            |                            |                          |
+            |  [Se comando/nome errato]  |                          |
+            |<-- ERR_BAD_REQUEST / ------|                          |
+            |<-- ERR_INVALID_NAME -------|                          |
+            |   (close client_sd)        |                          |
+            |                            |                          |
+            |                            |--- open(final, O_RDONLY)>|
+            |                            |                          |
+            |  [Se ENOENT / errore open] |                          |
+            |<-- ERR_NOT_FOUND / --------|                          |
+            |<-- ERR_IO -----------------|                          |
+            |   (close client_sd)        |                          |
+            |                            |                          |
+            |                            |--- fstat(file_fd) ------>|
+            |                            |    (verifica S_ISREG)    |
+            |                            |                          |
+            |<-- DATA <size> ------------|                          |
+            |<== send_file_stream() =====|<-- read(file_fd) --------|
+            |   (esattamente size byte)  |                          |
+            |                            |                          |
+            |                            |--- close(file_fd) ------>|
+            |   (close client_sd)        |                          |
