@@ -1,285 +1,237 @@
-SPECIFICHE DI PROGETTO - MINISTORE (RETI INFORMATICHE COD. 54511)
+DOCUMENTO DEI REQUISITI E VINCOLI DI PROGETTO - MINISTORE
 ======================================================================
 
-1. ARCHITETTURA GENERALE E VINCOLI DI SISTEMA
+1. REQUISITI FUNZIONALI (RF)
 ----------------------------------------------------------------------
 
-- Obiettivo: Sistema distribuito basato su socket per memorizzare e
-  recuperare file (MiniStore).
-- Linguaggio e rete: Linguaggio C; uso esclusivo di socket TCP/IPv4
-  sulla stessa macchina tramite indirizzo loopback 127.0.0.1. I processi
-  devono comportarsi come entita' di rete indipendenti.
-- Meccanismi vietati: E' vietato usare file condivisi, memoria
-  condivisa, pipe o altri meccanismi IPC per sostituire le
-  comunicazioni via socket tra le entita'.
+[RF-01] Avvio, CLI ed Exit Status
+  Il sistema deve produrre tre eseguibili nella directory radice:
+  - ./coordinator <coordinator_port>
+  - ./storage <coordinator_port> <storage_port> <storage_directory>
+  - ./client <coordinator_port> <put|get|list> ...
+  Il Client esegue una singola operazione e termina con exit status 0
+  in caso di successo o diverso da 0 in caso di errore. Coordinator e
+  Storage restano in esecuzione fino alla ricezione di SIGINT o SIGTERM,
+  terminando con exit status diverso da 0 (metteremo exit_status
+  (EXIT_FAILURE) per compatibilità con qualsiasi macchina in cui 
+  viene eseguito) se i parametri iniziali non sono validi oppure se lo 
+  Storage non riesce a registrarsi presso il Coordinator.
 
-Ruoli delle tre entita':
-1) Coordinator:
-   - Mantiene l'elenco degli Storage attivi e l'indice globale dei file.
-   - Non riceve, non inoltra e non trasferisce mai il contenuto dei file.
-2) Storage:
-   - Memorizza fisicamente i file in una directory locale (ogni istanza
-     di Storage deve avere una directory distinta).
-   - Si registra presso il Coordinator e accetta connessioni TCP dai
-     Client per operazioni di upload e download.
-3) Client:
-   - Interroga il Coordinator per sapere dove salvare o trovare un file
-     e trasferisce il contenuto direttamente con lo Storage indicato.
+[RF-02] Inizializzazione e Registrazione Storage
+  All'avvio lo Storage verifica che storage_directory esista e sia una
+  directory, rimuove eventuali file .part residui, apre il listening
+  socket sulla storage_port e stabilisce una connessione TCP persistente
+  verso il Coordinator inviando REGISTER <storage_port>. Solo dopo aver
+  ricevuto REGISTERED <storage_id> (con ID intero positivo assegnato in
+  ordine crescente a partire da 1 e mai riutilizzato) inizia ad
+  accettare connessioni dai Client. Se il Coordinator chiude la
+  connessione persistente, lo Storage termina con exit status diverso
+  da 0.
 
-Separazione obbligatoria tra piano di controllo e piano dati:
-  Client <---- TCP controllo --------------------> Coordinator
-  Client <---- TCP dati -------------------------> Storage
-  Storage <--- TCP controllo persistente --------> Coordinator
+[RF-03] Multiplexing e Indice Globale nel Coordinator
+  Il Coordinator accetta sulla stessa porta sia Storage sia Client,
+  distinguendoli dal primo messaggio ricevuto: REGISTER identifica una
+  connessione persistente Storage; PUT, GET o LIST identificano una
+  connessione one-shot Client. Il Coordinator aggiorna l'indice globale
+  alla ricezione di STORED <remote_name> <size> rispondendo ACK. In
+  caso di EOF, errore di rete o messaggio STORED malformato sulla
+  connessione persistente, rimuove lo Storage dall'elenco dei nodi
+  attivi e cancella dall'indice tutti i file ad esso associati.
+
+[RF-04] Caricamento File (PUT e UPLOAD)
+  Il Client verifica l'esistenza del file locale, ne ricava la
+  dimensione tramite stat()/fstat(), valida remote_name e richiede
+  PUT <remote_name> <size> al Coordinator. Il Coordinator seleziona lo
+  Storage attivo con storage_id piu' piccolo e risponde
+  STORE <storage_id> 127.0.0.1 <storage_port> senza prenotare il nome
+  nell'indice. Il Client invia quindi UPLOAD <remote_name> <size> allo
+  Storage, attende READY e trasmette esattamente size byte. Lo Storage
+  salva su <remote_name>.part, rinomina atomicamente in <remote_name>
+  a ricezione completata, notifica STORED al Coordinator attendendo
+  ACK e risponde STORED <remote_name> <size> al Client.
+
+[RF-05] Recupero File (GET e DOWNLOAD)
+  Il Client interroga il Coordinator con GET <remote_name> ottenendo
+  FOUND <storage_id> 127.0.0.1 <storage_port> <size>, quindi richiede
+  DOWNLOAD <remote_name> allo Storage indicato. Lo Storage risponde
+  DATA <size> seguito da esattamente size byte. Il Client verifica che
+  la dimensione in DATA coincida con quella in FOUND, salva i dati su
+  <local_file>.part e lo rinomina in <local_file> (sovrascrivendo se
+  gia' presente) solo al completamento di tutti i byte, eliminando il
+  file .part in caso di disconnessione prematura.
+
+[RF-06] Elenco File Disponibili (LIST)
+  Alla richiesta LIST del Client, il Coordinator risponde con
+  FILES <n>, seguito da n righe FILE <remote_name> <size> <storage_id>
+  ordinate in senso crescente byte-per-byte secondo strcmp() (lettere
+  maiuscole precedenti alle minuscole), e chiude con END (oppure
+  FILES 0 seguito da END se l'indice e' vuoto).
+
+[RF-07] Validazione Rigorosa e Gestione Errori
+  Client, Coordinator e Storage validano sintassi, tipi interi e nomi
+  remoti ([A-Za-z0-9._-]+, lunghezza 1..64, diverso da ".", privo di
+  ".." e non terminante con .part). In presenza di piu' errori
+  contemporanei, il server risponde con il primo secondo l'ordine
+  tassativo:
+    1. ERR BAD_REQUEST
+    2. ERR INVALID_NAME
+    3. ERR INVALID_SIZE / ERR INVALID_PORT
+    4. ERR FILE_EXISTS / ERR NOT_FOUND
+    5. ERR NO_STORAGE
 
 
-2. ESEGUIBILI, PARAMETRI CLI ED EXIT STATUS
+2. REQUISITI NON FUNZIONALI (RNF)
 ----------------------------------------------------------------------
 
-Devono essere prodotti tre eseguibili nella radice del progetto:
-- ./coordinator <coordinator_port>
-- ./storage <coordinator_port> <storage_port> <storage_directory>
-- ./client <coordinator_port> put <local_file> <remote_name>
-- ./client <coordinator_port> get <remote_name> <local_file>
-- ./client <coordinator_port> list
+[RNF-01] Concorrenza e assenza di blocchi (Coordinator)
+  Il Coordinator deve mantenere contemporaneamente le connessioni
+  persistenti di piu' Storage e servire almeno 5 Client simultanei
+  senza bloccarsi su Client lenti (anche in caso di invio a 1 byte alla
+  volta).
 
-Regole di esecuzione:
-- Le porte sono fornite a runtime (mai codificate nel sorgente); l'IP
-  e' fissato a 127.0.0.1 e non va passato da riga di comando.
-- Client: esegue una singola operazione e termina. Exit status 0 in
-  caso di successo, diverso da 0 in caso di errore. L'output stampato
-  dal Client per debug e' libero e non viene usato dal protocollo.
-- Coordinator e Storage: restano in esecuzione fino alla ricezione di
-  SIGINT o SIGTERM. Se all'avvio un parametro non e' valido, oppure se
-  lo Storage non riesce a registrarsi presso il Coordinator, il processo
-  stampa un messaggio di errore e termina con exit status diverso da 0.
-
-
-3. CONVENZIONI SU FILE, NOMI REMOTI E FRAMING TCP
-----------------------------------------------------------------------
-
-File e payload:
-- Contenuto trattato come sequenza generica di byte (binario/raw): non
-  e' ammesso interpretarlo riga per riga per determinare la fine.
-- Dimensione ammessa: da $0$ byte (file vuoto) a $10\text{ MB}$ inclusi,
-  dove $10\text{ MB}$ equivale esattamente a $10\,485\,760$ byte.
-- La dimensione del file deve essere ricavata programmaticamente
-  tramite stat() o fstat() (mai inserita manualmente).
-- Trasferimento in streaming obbligatorio: non e' ammesso allocare un
-  buffer grande quanto l'intero file; ogni iterazione di lettura o
-  scrittura deve gestire al massimo $4096$ byte.
-
-Nomi remoti (remote_name):
-- Formato ammesso: [A-Za-z0-9._-]+ con lunghezza da $1$ a $64$
-  caratteri.
-- Vincoli negativi: non puo' essere ".", non puo' contenere "..", non
-  puo' terminare con ".part" (suffisso riservato ai file temporanei).
-- Spazi, slash (/) e backslash (\) non sono mai ammessi.
-- I vincoli sul remote_name devono essere verificati sia dal Client
-  (prima di contattare il Coordinator), sia dal Coordinator e dallo
-  Storage.
-
-Messaggi di controllo e interi:
-- Formato testuale ASCII terminato da un singolo '\n'. Il carattere
-  '\r' non fa parte del protocollo: una riga terminata da '\r\n' e'
-  malformata (ERR BAD_REQUEST).
-- Campi separati da esattamente uno spazio: spazi iniziali, finali o
-  multipli rendono il messaggio malformato (ERR BAD_REQUEST).
-- Lunghezza massima riga di controllo: $512$ byte, '\n' incluso. Se il
-  ricevente accumula $512$ byte senza trovare '\n', risponde
-  ERR BAD_REQUEST e chiude la connessione.
-- Interi: rappresentazione decimale ASCII composta solo dalle cifre
-  '0'..'9', senza segno ne' altri caratteri (es. -1 o 12a sono non
-  validi: ERR INVALID_SIZE per size, ERR INVALID_PORT per port).
-
-Framing TCP:
-- Non assumere corrispondenza 1-a-1 tra send() e recv(): gestire
-  ricezioni/invii parziali e piu' messaggi accorpati nello stesso
-  flusso TCP.
-- Accumulare i byte ricevuti in un buffer associato alla connessione;
-  estrarre una riga completa solo quando compare '\n'; conservare e
-  utilizzare i byte successivi al '\n' (appartenenti al messaggio o al
-  payload seguente).
-- Ripetere send() in ciclo fino all'invio completo di tutti i byte.
-- Dopo DATA <size> o READY (in UPLOAD) vengono scambiati esattamente i
-  byte dichiarati in size senza delimitatore di fine file.
-
-
-4. PROTOCOLLO STORAGE <-> COORDINATOR
-----------------------------------------------------------------------
-
-Sequenza di avvio dello Storage:
-1) Verifica che storage_directory esista e sia una directory, altrimenti
-   termina con errore.
-2) Crea il listening socket sulla storage_port.
-3) Apre una connessione TCP persistente verso il Coordinator, invia
-   REGISTER e attende REGISTERED.
-4) Solo dopo la registrazione inizia ad accettare connessioni dai Client.
-5) I file eventualmente gia' presenti nella storage_directory all'avvio
-   non vengono annunciati al Coordinator; lo Storage puo' eliminare
-   all'avvio eventuali file .part residui.
-
-Registrazione dello Storage:
-- Storage -> Coordinator: REGISTER <storage_port>
-- Coordinator -> Storage: REGISTERED <storage_id>
-- storage_id: intero positivo assegnato dal Coordinator in ordine
-  crescente a partire da $1$ per ogni nuova registrazione valida; gli ID
-  non vengono mai riutilizzati.
-- Il Coordinator accetta sulla stessa porta sia Storage sia Client e
-  li distingue dal primo messaggio: REGISTER identifica una connessione
-  persistente Storage; PUT, GET o LIST identificano una connessione
+[RNF-02] Disponibilita' del canale di controllo (Storage)
+  Lo Storage deve mantenere attiva e reattiva la connessione di
+  controllo verso il Coordinator mentre accetta richieste dati dai
   Client.
-- Sulla connessione persistente il Coordinator non invia mai messaggi
-  di propria iniziativa: risponde solo a REGISTER (con REGISTERED) e a
-  STORED (con ACK).
-- Se la porta non e' un intero in $[1, 65535]$: ERR INVALID_PORT e
-  chiusura della connessione.
-- Se il messaggio di registrazione e' malformato: ERR BAD_REQUEST e
-  chiusura della connessione.
-- Disconnessione: se il Coordinator rileva EOF o errore sulla
-  connessione persistente di uno Storage, rimuove lo Storage dall'elenco
-  degli Storage attivi e rimuove dall'indice tutti i file associati a
-  quello Storage. Se lo Storage rileva la chiusura della connessione con
-  il Coordinator, termina con exit status diverso da 0.
 
-Notifica di memorizzazione completata:
-- Storage -> Coordinator: STORED <remote_name> <size>
-- Coordinator -> Storage: ACK
-- Inviato solo dopo che lo Storage ha ricevuto tutti i byte previsti,
-  ha chiuso il file e il file finale e' disponibile nella directory di
-  storage.
-- Il Coordinator associa il file allo Storage della connessione
-  persistente, aggiorna l'indice e risponde ACK.
-- Un messaggio STORED malformato comporta ERR BAD_REQUEST e chiusura
-  della connessione, con conseguente rimozione dello Storage e dei suoi
-  file.
+[RNF-03] Trasferimento in streaming e memoria limitata
+  E' vietato allocare buffer grandi quanto l'intero file; ogni
+  iterazione di lettura/scrittura del payload deve elaborare al massimo
+  4096 byte. Le righe di controllo non devono superare i 512 byte
+  (carattere '\n' incluso).
+
+[RNF-04] Affidabilita' e gestione dei segnali
+  Coordinator e Storage devono ignorare SIGPIPE (signal(SIGPIPE, SIG_IGN)
+  o MSG_NOSIGNAL) trattando EPIPE come disconnessione, gestire SIGINT e
+  SIGTERM per un arresto pulito e utilizzare file temporanei .part per
+  garantire atomicita' su disco. Si raccomanda l'uso di SO_REUSEADDR sui
+  listening socket.
+
+[RNF-05] Capacita' minime
+  Il Coordinator deve supportare almeno 16 nodi Storage registrati
+  contemporaneamente e almeno 1024 file nell'indice globale.
+
+[RNF-06] Qualita' di compilazione e ambiente target
+  Il codice deve compilare ed essere eseguito su Ubuntu 24 tramite
+  Makefile con flag -Wall abilitato producendo zero errori e zero
+  warning.
 
 
-5. PROTOCOLLO CLIENT <-> COORDINATOR
+3. VINCOLI TECNOLOGICI E ARCHITETTURALI (VT)
 ----------------------------------------------------------------------
 
-Per ogni comando put, get o list, il Client apre una connessione TCP
-verso il Coordinator, invia una singola richiesta, riceve la risposta
-e chiude la connessione.
+[VT-01] Linguaggio e Stack di Rete
+  Implementazione in linguaggio C standard con uso esclusivo di socket
+  TCP/IPv4 sull'indirizzo di loopback 127.0.0.1 e porte passate
+  dinamicamente a runtime (mai codificate nel sorgente).
 
-PUT - Richiesta di memorizzazione:
-- Client -> Coordinator: PUT <remote_name> <size>
-- Coordinator -> Client: STORE <storage_id> 127.0.0.1 <storage_port>
-- Il Coordinator seleziona, tra gli Storage attivi, quello con
-  storage_id piu' piccolo.
-- La risposta STORE NON prenota il nome: il file compare nell'indice
-  solo dopo la notifica STORED dello Storage.
-- Ordine tassativo dei controlli (risponde con il primo errore):
-  1) Numero campi diverso da 3 -> ERR BAD_REQUEST
-  2) Nome non valido -> ERR INVALID_NAME
-  3) size non intera valida o $> 10\text{ MB}$ -> ERR INVALID_SIZE
-  4) remote_name gia' presente nell'indice -> ERR FILE_EXISTS
-  5) Nessuno Storage attivo presente -> ERR NO_STORAGE
+[VT-02] Separazione Piano di Controllo e Piano Dati
+  Il Coordinator gestisce esclusivamente traffico di controllo testuale
+  e non deve mai ricevere, inoltrare o transitare il contenuto binario
+  dei file.
 
-GET - Individuazione di un file:
-- Client -> Coordinator: GET <remote_name>
-- Coordinator -> Client: FOUND <storage_id> 127.0.0.1 <storage_port> <size>
-- Ordine dei controlli:
-  1) Numero campi diverso da 2 -> ERR BAD_REQUEST
-  2) Nome non valido -> ERR INVALID_NAME
-  3) File assente nell'indice o Storage associato non attivo -> ERR NOT_FOUND
+[VT-03] Divieto di IPC alternativo
+  E' vietato sostituire le comunicazioni socket tra i processi mediante
+  file condivisi, memoria condivisa (shm_open, mmap), pipe o code di
+  messaggi.
 
-LIST - Elenco dei file disponibili:
-- Client -> Coordinator: LIST
-- Coordinator -> Client:
-    FILES <n>
-    FILE <remote_name_1> <size_1> <storage_id_1>
-    ...
-    FILE <remote_name_n> <size_n> <storage_id_n>
-    END
-- Il comando LIST non ammette argomenti (altrimenti ERR BAD_REQUEST).
-- Le righe FILE devono essere ordinate in ordine crescente di
-  remote_name confrontando byte per byte come strcmp() (lettere
-  maiuscole precedono le minuscole).
-- Se non esistono file, la risposta e' FILES 0 seguita da END.
+[VT-04] Framing del Protocollo Applicativo
+  - Messaggi di controllo in ASCII terminati da un singolo '\n' ('\r\n'
+    e' considerato ERR_BAD_REQUEST).
+  - Campi separati da esattamente uno spazio (spazi iniziali, finali o
+    multipli causano ERR_BAD_REQUEST).
+  - Interi rappresentati esclusivamente da cifre decimali ASCII '0'..'9'
+    senza segno ne' altri caratteri (se rappresentati con segno, ERR_BAD_
+    REQUEST)
+  - Dimensione massima del file pari a 10 MB (esattamente 10485760 byte)
+    (se viene superata la dimensione massima, ERR_INVALID_SIZE)
+  - Gestione esplicita dello stream TCP tramite buffer di accumulo per
+    connessione (nessuna assunzione di corrispondenza 1-a-1 tra send() e
+    recv()) e cicli completi di send().
+
+[VT-05] Struttura della Consegna
+  Archivio <matricola>.zip contenente esclusivamente:
+  - Makefile
+  - sorgenti *.c e *.h
+  - report.pdf (massimo 3 pagine, almeno 3 interazioni AI documentate)
+  - validation_report.txt (generato da validator_studente.py)
+  E' vietato includere file binari compilati o directory di build.
 
 
-6. PROTOCOLLO CLIENT <-> STORAGE (TRASFERIMENTO FILE)
+4. CRITERI DI ACCETTAZIONE (CA)
 ----------------------------------------------------------------------
 
-UPLOAD:
-- Client -> Storage:      UPLOAD <remote_name> <size>
-- Storage -> Client:      READY   (oppure ERR ... e chiusura)
-- Client -> Storage:      <esattamente size byte di payload>
-- Storage -> Coordinator: STORED <remote_name> <size>
-- Coordinator -> Storage: ACK
-- Storage -> Client:      STORED <remote_name> <size>
+[CA-01] Compilazione
+  "make clean && make" dalla directory radice genera coordinator,
+  storage e client senza errori ne' warning sotto gcc -Wall.
 
-Regole UPLOAD:
-- Prima di READY lo Storage verifica nell'ordine: numero campi
-  (ERR BAD_REQUEST), nome (ERR INVALID_NAME), dimensione
-  (ERR INVALID_SIZE), esistenza file o .part locale (ERR FILE_EXISTS).
-- Scrittura su file temporaneo <storage_directory>/<remote_name>.part;
-  solo dopo aver ricevuto e scritto esattamente size byte, rinomina in
-  <storage_directory>/<remote_name>.
-- Se size e' $0$: dopo READY non attende byte, crea il file vuoto e
-  prosegue con STORED al Coordinator e STORED al Client.
-- Se il Client chiude prima di inviare tutti i byte: lo Storage elimina
-  il file .part e non notifica il Coordinator.
-- Errore di filesystem -> ERR IO (se la connessione consente risposta).
-- Se la notifica STORED al Coordinator fallisce (connessione chiusa o
-  risposta diversa da ACK): lo Storage elimina il file finale e
-  risponde ERR IO al Client.
+[CA-02] Registrazione e Routing
+  Lo Storage riceve ID progressivi a partire da 1 (REGISTERED <id>);
+  PUT instrada sempre verso lo Storage attivo con storage_id minimo;
+  STORE non inserisce il file nell'indice prima di STORED.
 
-DOWNLOAD:
-- Client -> Storage: DOWNLOAD <remote_name>
-- Storage -> Client: DATA <size>
-- Storage -> Client: <esattamente size byte di payload>
+[CA-03] Integrita' End-to-End
+  I file caricati tramite "./client ... put" e recuperati tramite
+  "./client ... get" risultano identici byte-per-byte agli originali.
 
-Regole DOWNLOAD:
-- Errori Storage: nome non valido -> ERR INVALID_NAME; file non
-  presente nello Storage -> ERR NOT_FOUND.
-- Il Client crea <local_file>.part e lo rinomina in <local_file> solo
-  dopo aver ricevuto esattamente size byte (sovrascrivendo <local_file>
-  se gia' esistente); in caso di disconnessione prematura elimina .part.
-- Il Client verifica che size annunciata in DATA coincida con size
-  ricevuta in FOUND; in caso contrario termina con errore.
+[CA-04] Dimensioni Limite
+  Trasferimenti completati con successo per file di dimensione 0, 1,
+  4095, 4096, 4097 byte e fino a 10485760 byte (10 MB); rifiuto con
+  ERR INVALID_SIZE oltre i 10 MB.
+
+[CA-05] Framing TCP Frammentato
+  Righe di controllo inviate 1 byte alla volta o header e payload
+  accorpati nella stessa send() vengono ricostruiti correttamente senza
+  perdita di byte ne' blocchi.
+
+[CA-06] Formato e Ordinamento LIST
+  L'output di LIST rispetta la sintassi FILES <n> / FILE <name> <size>
+  <id> / END ed e' ordinato secondo strcmp().
+
+[CA-07] Gestione Errori e Precedenze
+  Tutti gli errori obbligatori (ERR BAD_REQUEST, ERR INVALID_NAME,
+  ERR INVALID_SIZE, ERR INVALID_PORT, ERR NO_STORAGE, ERR FILE_EXISTS,
+  ERR NOT_FOUND, ERR IO) sono restituiti secondo l'ordine di priorita'
+  stabilito.
+
+[CA-08] Fault Tolerance e Pulizia
+  La chiusura improvvisa di uno Storage rimuove immediatamente il nodo
+  e i suoi file dall'indice; l'interruzione di un upload o download
+  elimina i file .part temporanei senza lasciare voci corrotte.
+
+[CA-09] Concorrenza Coordinator
+  Un Client lento che invia dati a rilento non impedisce ad altri 5 o
+  piu' Client simultanei o agli Storage di ricevere risposta immediata.
+
+[CA-10] Validazione e Documentazione
+  Esecuzione completa di "python3 validator_studente.py" con
+  generazione di validation_report.txt e redazione di report.pdf
+  conforme alle linee guida.
 
 
-7. MESSAGGI DI ERRORE OBBLIGATORI E PRECEDENZA
+5. ELEMENTI FUORI DALLO SCOPO (OUT OF SCOPE)
 ----------------------------------------------------------------------
 
-Elenco messaggi di errore:
-- ERR BAD_REQUEST  : comando sconosciuto, campi errati o sintassi invalida.
-- ERR INVALID_NAME : remote_name non conforme ai vincoli.
-- ERR INVALID_SIZE : dimensione non valida o superiore a $10\text{ MiB}$.
-- ERR INVALID_PORT : porta non valida (non intero in $[1, 65535]$).
-- ERR NO_STORAGE   : nessuno Storage attivo disponibile per PUT.
-- ERR FILE_EXISTS  : file gia' registrato o gia' presente nello Storage.
-- ERR NOT_FOUND    : file non presente o non piu' disponibile.
-- ERR IO           : errore locale apertura/lettura/scrittura/rinomina.
-
-Precedenza in caso di errori multipli:
-  ERR BAD_REQUEST -> ERR INVALID_NAME -> ERR INVALID_SIZE / ERR INVALID_PORT
-  -> ERR FILE_EXISTS / ERR NOT_FOUND -> ERR NO_STORAGE
-
-Chiusura dopo errore:
-- Dopo un errore su Client <-> Coordinator o Client <-> Storage il
-  ricevente puo' chiudere la connessione.
-- Un errore di protocollo sulla connessione persistente Storage <->
-  Coordinator comporta sempre la chiusura della connessione.
-
-
-8. CONCORRENZA, SEGNALI E CAPACITA' MINIME
-----------------------------------------------------------------------
-
-- Concorrenza Coordinator: deve mantenere contemporaneamente le
-  connessioni persistenti di piu' Storage e servire almeno $5$ Client
-  contemporaneamente senza bloccarsi su Client lenti (anche 1 byte
-  alla volta). Modello libero (select(), thread o processi) da motivare.
-- Concorrenza Storage: deve mantenere aperta la connessione di controllo
-  con il Coordinator mentre accetta Client. E' ammesso un server dati
-  iterativo purche' resti registrato e non perda il controllo.
-- Gestione SIGPIPE: ignorato con signal(SIGPIPE, SIG_IGN) o
-  MSG_NOSIGNAL in send(), trattando EPIPE come disconnessione.
-- Opzione socket: consigliato SO_REUSEADDR sui listening socket.
-- Capacita' minime: strutture dati anche a dimensione fissa purche' il
-  Coordinator gestisca almeno $16$ Storage registrati e $1024$ file
-  nell'indice.
-
-
-- si ha a disposizione 
+- Comandi di modifica o cancellazione remota: non sono previste
+  operazioni per eliminare (DELETE), rinominare o sovrascrivere file
+  gia' registrati nell'indice del Coordinator (un nome gia' presente
+  restituisce ERR FILE_EXISTS).
+- Persistenza dell'indice e recupero di file preesistenti: il
+  Coordinator mantiene l'indice esclusivamente in memoria volatile; i
+  file eventualmente gia' presenti nella storage_directory all'avvio
+  dello Storage non vengono annunciati al Coordinator.
+- Replicazione e bilanciamento avanzato: i file non vengono replicati
+  su piu' nodi Storage e il bilanciamento del carico non considera
+  spazio disco residuo o banda, attenendosi alla regola deterministica
+  dello storage_id attivo piu' piccolo.
+- Heartbeat periodici e timeout su Client inattivi: non e' richiesto un
+  meccanismo di heartbeat applicativo tra Storage e Coordinator (la
+  disponibilita' coincide con lo stato della connessione TCP
+  persistente), ne' e' richiesto di disconnettere Client inattivi
+  purche' non blocchino il Coordinator.
+- Trasferimenti dati paralleli sul singolo Storage: lo Storage non e'
+  tenuto a gestire piu' upload/download simultanei (e' esplicitamente
+  ammesso un server dati iterativo).
+- Sicurezza e comunicazione multi-host: sono esclusi indirizzi IP
+  diversi da 127.0.0.1, autenticazione degli utenti, controllo degli
+  accessi, cifratura TLS e calcolo di digest/checksum applicativi.
